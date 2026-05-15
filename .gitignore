@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Reference Files (Large)
+*.zip
+*.tox
+*.toe
+refererence_files/
+InteractiveFlower/
+__MACOSX/
+
+# MediaPipe models
+hand_landmarker.task
+
+
+# Build/ModernGL
+*.log
