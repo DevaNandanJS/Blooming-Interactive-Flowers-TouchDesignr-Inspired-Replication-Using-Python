@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Flowers-For-Her — Reference Design</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0608;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Georgia', serif;
+    color: #f0c060;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 13px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: #c88a30;
+    margin-bottom: 6px;
+    opacity: 0.8;
+  }
+  h2 {
+    font-size: 22px;
+    font-weight: 300;
+    letter-spacing: 0.08em;
+    color: #f7d070;
+    margin-bottom: 24px;
+  }
+  canvas {
+    border-radius: 8px;
+    box-shadow: 0 0 60px rgba(220, 100, 20, 0.18), 0 0 120px rgba(180, 60, 10, 0.08);
+    display: block;
+    max-width: 100%;
+  }
+  .legend {
+    display: flex;
+    gap: 28px;
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #a08040;
+    opacity: 0.85;
+  }
+  .legend-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .footer {
+    margin-top: 16px;
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    color: #604820;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+<h1>Flowers-For-Her · Design Reference</h1>
+<h2>Interactive Blooming Lily System</h2>
+<canvas id="c" width="820" height="620"></canvas>
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#d04a10"></div>Fire-orange base</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f0a820"></div>Golden-yellow bloom</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#6080d8"></div>Branch skeleton</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ffffff44;border:1px solid #888"></div>Translucent petals</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ffe060"></div>Stamen / pistil</div>
+</div>
+<div class="footer">Left hand → growth &nbsp;·&nbsp; Right hand → bloom</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// ── Helpers ──────────────────────────────────────────────────────
+function lerp(a,b,t){ return a+(b-a)*t; }
+function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
+function rgb(r,g,b,a=1){ return `rgba(${r|0},${g|0},${b|0},${clamp(a,0,1)})`; }
+
+// Fire → gold colour
+function flameColor(t, alpha=1){
+  // t: 0=deep fire-orange, 1=bright golden-yellow
+  const r = lerp(180, 255, t);
+  const g = lerp(40,  200, t);
+  const b = lerp(5,   30,  t);
+  return rgb(r, g, b, alpha);
+}
+
+// ── Glow helper ──────────────────────────────────────────────────
+function withGlow(color, blur, fn){
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur  = blur;
+  fn();
+  ctx.restore();
+}
+
+// ── Background: fake webcam silhouette ───────────────────────────
+function drawBackground(){
+  ctx.fillStyle = '#070408';
+  ctx.fillRect(0,0,W,H);
+
+  // subtle radial atmosphere at centre
+  const g = ctx.createRadialGradient(W/2, H*0.7, 30, W/2, H*0.7, 380);
+  g.addColorStop(0,'rgba(60,20,5,0.22)');
+  g.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // person silhouette (simplified dark blob)
+  ctx.fillStyle = 'rgba(12,8,14,0.85)';
+  ctx.beginPath();
+  // head
+  ctx.ellipse(W/2, H*0.55, 62, 75, 0, 0, Math.PI*2);
+  ctx.fill();
+  // body
+  ctx.fillStyle = 'rgba(14,9,16,0.9)';
+  ctx.beginPath();
+  ctx.ellipse(W/2, H*0.82, 110, 100, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // faint vignette
+  const v = ctx.createRadialGradient(W/2,H/2,W*0.3,W/2,H/2,W*0.75);
+  v.addColorStop(0,'rgba(0,0,0,0)');
+  v.addColorStop(1,'rgba(0,0,0,0.7)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0,0,W,H);
+}
+
+// ── Branch system ────────────────────────────────────────────────
+const GROWTH = 0.82;   // 0-1 trunk growth
+const BLOOM  = 0.76;   // 0-1 petal openness
+
+// Draw a single branch segment with skeleton glow
+function drawBranch(x1,y1,x2,y2, thickness, brightness=0.7){
+  const alphaLine  = 0.55 * brightness;
+  const glowBright = rgb(100,140,255, alphaLine*0.8);
+
+  withGlow(glowBright, 10, ()=>{
+    ctx.strokeStyle = rgb(70,110,220, alphaLine);
+    ctx.lineWidth   = thickness;
+    ctx.lineCap     = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x1,y1);
+    ctx.lineTo(x2,y2);
+    ctx.stroke();
+  });
+
+  // thin bright core
+  ctx.strokeStyle = rgb(160,190,255, alphaLine*0.6);
+  ctx.lineWidth   = thickness * 0.3;
+  ctx.beginPath();
+  ctx.moveTo(x1,y1);
+  ctx.lineTo(x2,y2);
+  ctx.stroke();
+}
+
+// ── Single lily petal ─────────────────────────────────────────────
+function drawPetal(cx, cy, angle, length, width, bloomT, layer){
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(angle);
+
+  // Petal opens outward: when bloom=0 petals are nearly vertical,
+  // when bloom=1 they spread open
+  const openAngle = lerp(-Math.PI*0.42, -Math.PI*0.08, bloomT);
+  ctx.rotate(openAngle);
+
+  // curl tip
+  const curlY = -length * lerp(0.1, 0.0, bloomT);
+
+  ctx.save();
+  ctx.translate(0, -length * 0.15);
+
+  // gradient: root fire-orange → tip golden
+  const grad = ctx.createLinearGradient(0,0, 0,-length);
+  const baseAlpha = layer === 0 ? 0.72 : 0.52;
+  grad.addColorStop(0,   flameColor(0.05, baseAlpha));
+  grad.addColorStop(0.35, flameColor(0.3, baseAlpha*0.9));
+  grad.addColorStop(0.7,  flameColor(0.68, baseAlpha*0.8));
+  grad.addColorStop(1,    flameColor(0.92, baseAlpha*0.55));
+
+  // petal shape: bezier curve
+  const hw = width * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(0,0);
+  ctx.bezierCurveTo(-hw*1.4, -length*0.3,  -hw*1.1, -length*0.7, 0, -length + curlY);
+  ctx.bezierCurveTo( hw*1.1, -length*0.7,   hw*1.4, -length*0.3, 0, 0);
+  ctx.closePath();
+
+  withGlow(flameColor(0.5, 0.4), 18, ()=>{
+    ctx.fillStyle = grad;
+    ctx.fill();
+  });
+
+  // ridge / vein
+  ctx.strokeStyle = flameColor(0.85, 0.35);
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  ctx.moveTo(0,0);
+  ctx.quadraticCurveTo(0, -length*0.5, 0, -length + curlY);
+  ctx.stroke();
+
+  ctx.restore();
+  ctx.restore();
+}
+
+// ── Full flower head ──────────────────────────────────────────────
+function drawFlower(cx, cy, size, bloomT, angle=0){
+  const nPetals  = 6;
+  const nLayers  = 2;
+
+  for(let layer = 1; layer >= 0; layer--){
+    const layerBloom = clamp(bloomT * (layer===1 ? 0.85 : 1.0), 0, 1);
+    const pLen  = size * (layer===0 ? 1.0 : 0.72);
+    const pWid  = size * (layer===0 ? 0.38 : 0.30);
+    const offset= layer===0 ? 0 : Math.PI/6;
+
+    for(let i=0;i<nPetals;i++){
+      const a = (i/nPetals)*Math.PI*2 + offset + angle;
+      drawPetal(cx, cy, a, pLen, pWid, layerBloom, layer);
+    }
+  }
+
+  // stamen visibility fades in with bloom
+  const sAlpha = bloomT * bloomT;
+  if(sAlpha > 0.05){
+    const nStamen = 8;
+    for(let i=0;i<nStamen;i++){
+      const a = (i/nStamen)*Math.PI*2;
+      const sr = size * 0.18 * bloomT;
+      const sx = cx + Math.cos(a)*sr;
+      const sy = cy + Math.sin(a)*sr;
+      const sLen = size * 0.22 * bloomT;
+
+      // stamen filament
+      ctx.strokeStyle = rgb(255,220,60, sAlpha*0.7);
+      ctx.lineWidth   = 1;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx + Math.cos(a)*sLen, sy + Math.sin(a)*sLen);
+      ctx.stroke();
+
+      // anther dot
+      withGlow(rgb(255,240,80,0.8), 6, ()=>{
+        ctx.fillStyle = rgb(255,230,50, sAlpha);
+        ctx.beginPath();
+        ctx.arc(sx + Math.cos(a)*sLen, sy + Math.sin(a)*sLen, 2.2, 0, Math.PI*2);
+        ctx.fill();
+      });
+    }
+
+    // central pistil
+    withGlow(rgb(255,200,30,0.9), 12, ()=>{
+      ctx.fillStyle = rgb(255,210,40, sAlpha);
+      ctx.beginPath();
+      ctx.arc(cx, cy, size*0.09*bloomT, 0, Math.PI*2);
+      ctx.fill();
+    });
+  }
+}
+
+// ── Recursive branching tree ──────────────────────────────────────
+function buildTree(){
+  // Returns array of {x,y,size,angle} for each flower head
+  const flowers = [];
+
+  const trunk = {
+    x: W/2, y: H*0.92,
+    length: 220 * GROWTH,
+    angle: -Math.PI/2, // straight up
+    thickness: 5,
+    depth: 0
+  };
+
+  function branch(x,y,angle,len,thick,depth){
+    if(depth > 3 || len < 18) return;
+    const endX = x + Math.cos(angle)*len;
+    const endY = y + Math.sin(angle)*len;
+
+    drawBranch(x, y, endX, endY, thick, 0.5 + depth*0.15);
+
+    if(depth === 3 || len < 35){
+      // terminal: place flower here
+      flowers.push({ x:endX, y:endY, size: 38 + thick*2, angle });
+      return;
+    }
+
+    // split into child branches
+    const nSplit  = depth < 2 ? 3 : 2;
+    const spread  = depth < 2 ? Math.PI*0.28 : Math.PI*0.32;
+    for(let i=0;i<nSplit;i++){
+      const off    = (i/(nSplit-1) - 0.5) * spread * 2;
+      const cAngle = angle + off;
+      const cLen   = len   * lerp(0.68, 0.6, depth/3);
+      const cThick = thick * 0.7;
+      const cx2    = endX + Math.cos(cAngle)*cLen*0.08;
+      const cy2    = endY + Math.sin(cAngle)*cLen*0.08;
+      branch(endX, endY, cAngle, cLen, cThick, depth+1);
+    }
+  }
+
+  // main trunk
+  const trunkEndX = trunk.x;
+  const trunkEndY = trunk.y - trunk.length;
+  drawBranch(trunk.x, trunk.y, trunkEndX, trunkEndY, trunk.thickness, 0.6);
+
+  // side branches from trunk at different heights
+  const branchDefs = [
+    { frac:0.55, angle:-Math.PI/2 - 0.55, len:110, thick:3.2 },
+    { frac:0.55, angle:-Math.PI/2 + 0.55, len:110, thick:3.2 },
+    { frac:0.72, angle:-Math.PI/2 - 0.35, len:90,  thick:2.8 },
+    { frac:0.72, angle:-Math.PI/2 + 0.35, len:90,  thick:2.8 },
+    { frac:0.88, angle:-Math.PI/2 - 0.2,  len:70,  thick:2.4 },
+    { frac:0.88, angle:-Math.PI/2 + 0.2,  len:70,  thick:2.4 },
+  ];
+
+  for(const bd of branchDefs){
+    const bx = trunk.x;
+    const by = trunk.y - trunk.length * bd.frac * GROWTH;
+    if(by > trunk.y - trunk.length * GROWTH){
+      branch(bx, by, bd.angle, bd.len * GROWTH, bd.thick, 1);
+    }
+  }
+
+  // top of trunk also flowers
+  branch(trunkEndX, trunkEndY, -Math.PI/2, 70*GROWTH, 2.5, 2);
+
+  return flowers;
+}
+
+// ── Bloom post-fx layer (additive orange haze) ────────────────────
+function drawBloomHaze(flowers){
+  for(const f of flowers){
+    const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, f.size * 2.2);
+    g.addColorStop(0,   flameColor(0.6, 0.18 * BLOOM));
+    g.addColorStop(0.5, flameColor(0.3, 0.07 * BLOOM));
+    g.addColorStop(1,   'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillRect(f.x - f.size*2.5, f.y - f.size*2.5, f.size*5, f.size*5);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+// ── Annotation labels ─────────────────────────────────────────────
+function drawAnnotations(){
+  ctx.font = '10px monospace';
+  ctx.fillStyle = 'rgba(160,130,60,0.65)';
+  ctx.letterSpacing = '0.1em';
+
+  const notes = [
+    [W*0.07, H*0.12, '← Left hand'],
+    [W*0.07, H*0.17, '  open palm'],
+    [W*0.07, H*0.22, '  → tree grows'],
+    [W*0.73, H*0.12, 'Right hand →'],
+    [W*0.73, H*0.17, '  open palm'],
+    [W*0.73, H*0.22, '  → petals open'],
+    [W*0.07, H*0.76, 'Bloom pass'],
+    [W*0.07, H*0.80, '(additive glow)'],
+    [W*0.73, H*0.76, 'Branch skeleton'],
+    [W*0.73, H*0.80, '(blue overlay)'],
+  ];
+
+  for(const [x,y,t] of notes){
+    ctx.fillText(t, x, y);
+  }
+
+  // dimension arrows
+  ctx.strokeStyle = 'rgba(120,100,50,0.3)';
+  ctx.lineWidth = 0.8;
+  ctx.setLineDash([4,4]);
+  ctx.beginPath();
+  ctx.moveTo(W/2, H*0.92);
+  ctx.lineTo(W/2, H*0.05);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // label: trunk height
+  ctx.fillStyle = 'rgba(120,90,30,0.55)';
+  ctx.font = '9px monospace';
+  ctx.fillText('trunk_h × plant_s', W/2+6, H*0.5);
+}
+
+// ── Render all ────────────────────────────────────────────────────
+function render(){
+  ctx.clearRect(0,0,W,H);
+  drawBackground();
+
+  // tree & branches
+  ctx.save();
+  const flowers = buildTree();
+  ctx.restore();
+
+  // bloom haze (post-fx)
+  drawBloomHaze(flowers);
+
+  // flower heads
+  for(const f of flowers){
+    drawFlower(f.x, f.y, f.size, BLOOM);
+  }
+
+  // annotations
+  drawAnnotations();
+
+  // title watermark bottom right
+  ctx.fillStyle = 'rgba(180,130,40,0.3)';
+  ctx.font = 'italic 11px Georgia';
+  ctx.textAlign = 'right';
+  ctx.fillText('Flowers-For-Her · Design Reference', W-16, H-12);
+  ctx.textAlign = 'left';
+}
+
+render();
+</script>
+</body>
+</html>

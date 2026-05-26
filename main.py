@@ -1,244 +1,262 @@
-"""
-Interactive Blooming Flower — Python Recreation
-================================================
-Multi-pass rendering pipeline with webcam compositing, hand-gesture-controlled
-flower growth and bloom, and post-processing glow.
+"""Flowers-For-Her — GPU-accelerated interactive lily tree.
 
-Controls:
-  - Left hand open palm  → flowers GROW (stem length + bud size)
-  - Right hand open palm → flowers BLOOM (petals open) + glow intensifies
-  - Stems grow in the direction each finger is pointing
-  - Flowers appear at all 10 fingertip positions
+Run:  python main.py
+
+Controls
+--------
+- Left hand open/close  → tree growth (height + scale).
+- Right hand open/close → flower bloom (petal opening + glow).
 """
+
+import struct
+import math
+import time
+from pathlib import Path
 
 import cv2
-import threading
-import queue
-import time
-import math
-import os
 import numpy as np
 import moderngl
 import moderngl_window as mglw
-from pyrr import Matrix44, Vector3
-from hand_tracking import HandTracker
-from geometry import create_petal_mesh, create_stem_mesh, create_center_mesh
+from moderngl_window.conf import settings
+from pyrr import Matrix44, Vector3, Quaternion
+
+from geometry import (
+    build_flower_mesh,
+    build_stamen_mesh,
+    build_stem_segment,
+    VERT_FLOATS,
+)
+from hand_tracking import CVWorker
 
 
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
+# ── Configuration ────────────────────────────────────────────────────
+WINDOW_SIZE     = (1280, 720)
+BG_COLOR        = (0.03, 0.02, 0.04, 1.0)
 
-def load_shader(name):
-    """Load a shader source file from the shaders/ directory."""
-    base = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base, 'shaders', name)
-    with open(path, 'r') as f:
-        return f.read()
+# Tree structure
+TRUNK_BASE_LEN  = 4.3        # GL units (80% bigger overall)
+BRANCH_SHRINK   = 0.65
+MAX_DEPTH       = 3
+MIN_BRANCH_LEN  = 0.05
 
 
-def build_rotation_from_direction(dx, dy):
+# ── Shader loading ──────────────────────────────────────────────────
+def _load_shader(name: str) -> str:
+    return (Path(__file__).parent / "shaders" / name).read_text()
+
+
+# ── Inline line shader (branch skeleton) ────────────────────────────
+_LINE_VERT = """
+#version 330
+in vec3 a_position;
+in vec4 a_color;
+uniform mat4 u_vp;
+out vec4 v_color;
+void main() {
+    gl_Position = u_vp * vec4(a_position, 1.0);
+    v_color = a_color;
+}
+"""
+
+_LINE_FRAG = """
+#version 330
+in vec4 v_color;
+out vec4 fragColor;
+void main() {
+    fragColor = v_color;
+}
+"""
+
+
+# ── Recursive branching tree ────────────────────────────────────────
+def _build_branches(growth: float):
+    """Build branch segments and flower positions.
+
+    Returns
+    -------
+    segments : list of (x1, y1, z1, x2, y2, z2, thickness)
+    flowers  : list of (x, y, z, size)
     """
-    Build a 4×4 rotation matrix that orients the local +Y axis along the 2D
-    screen-space direction (dx, dy).  Since MediaPipe y increases downward,
-    we negate dy so "up on screen" becomes +Y in world space.
-    """
-    # Negate dy to flip from screen coords to OpenGL coords
-    dy = -dy
-    length = math.sqrt(dx * dx + dy * dy)
-    if length < 1e-6:
-        return Matrix44.identity(dtype='f4')
+    segments = []
+    flowers  = []
+    trunk_len = TRUNK_BASE_LEN * growth
 
-    dx /= length
-    dy /= length
+    def _branch(x, y, z, angle, length, thickness, depth):
+        if depth > MAX_DEPTH or length < MIN_BRANCH_LEN:
+            return
+        ex = x + math.cos(angle) * length
+        ey = y + math.sin(angle) * length
+        ez = z
 
-    # Angle between (0,1) and (dx,dy) — the default stem direction is +Y
-    angle = math.atan2(dx, dy)  # rotation around Z
-    return Matrix44.from_z_rotation(-angle, dtype='f4')
+        segments.append((x, y, z, ex, ey, ez, thickness))
 
+        if depth == MAX_DEPTH or length < 0.25:
+            flower_size = 0.50 + thickness * 0.22
+            flowers.append((ex, ey, ez, flower_size))
+            return
 
-# ---------------------------------------------------------------------------
-# CV Worker Thread
-# ---------------------------------------------------------------------------
+        n_children = 3 if depth < 2 else 2
+        spread     = math.pi * (0.32 if depth < 2 else 0.36)
+        child_len  = length * BRANCH_SHRINK
+        child_thick = thickness * 0.7
 
-class CVWorker(threading.Thread):
-    """Runs webcam capture + MediaPipe hand detection on a background thread."""
+        for i in range(n_children):
+            frac = (i / (n_children - 1)) - 0.5 if n_children > 1 else 0.0
+            c_angle = angle + frac * spread * 2
+            _branch(ex, ey, ez, c_angle, child_len, child_thick, depth + 1)
 
-    def __init__(self, data_queue):
-        super().__init__(daemon=True)
-        self.data_queue = data_queue
-        self.running = True
-        self.tracker = HandTracker()
-        self.cap = cv2.VideoCapture(0)
-        # Try to set camera resolution
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # Main trunk (moved down to -1.5 to make room for taller tree)
+    trunk_base = (0.0, -1.5, 0.0)
+    trunk_top  = (0.0, -1.5 + trunk_len, 0.0)
+    segments.append((*trunk_base, *trunk_top, 0.11))
 
-    def run(self):
-        while self.running:
-            try:
-                ret, frame = self.cap.read()
-                if not ret:
-                    continue
+    # Side branches at different heights along the trunk (scaled lengths & thicknesses)
+    branch_defs = [
+        (0.55, math.pi / 2 - 0.65, 2.25, 0.080),
+        (0.55, math.pi / 2 + 0.65, 2.25, 0.080),
+        (0.72, math.pi / 2 - 0.45, 1.89, 0.070),
+        (0.72, math.pi / 2 + 0.45, 1.89, 0.070),
+        (0.88, math.pi / 2 - 0.25, 1.53, 0.050),
+        (0.88, math.pi / 2 + 0.25, 1.53, 0.050),
+    ]
 
-                frame = cv2.flip(frame, 1)  # Mirror
-                self.tracker.process_frame(frame)
-                hand_data = self.tracker.get_hand_data()
+    for frac, angle, rel_len, thick in branch_defs:
+        by = -1.5 + trunk_len * frac
+        if by <= -1.5 + trunk_len:
+            _branch(0.0, by, 0.0, angle, rel_len * growth, thick, 1)
 
-                # Draw skeleton overlay onto the frame
-                self.tracker.draw_skeleton(frame, hand_data)
+    # Top of trunk also branches straight up
+    _branch(trunk_top[0], trunk_top[1], 0.0,
+            math.pi / 2, 1.35 * growth, 0.060, 2)
 
-                # Package frame + hand data together
-                payload = {
-                    'frame': frame,
-                    'hand_data': hand_data,
-                }
-
-                # Always keep only the latest data
-                try:
-                    while not self.data_queue.empty():
-                        self.data_queue.get_nowait()
-                    self.data_queue.put(payload)
-                except queue.Full:
-                    pass
-
-            except Exception as e:
-                if self.running:
-                    print(f"CV Worker Error: {e}")
-                break
-
-            time.sleep(0.005)
-
-        self.cap.release()
-
-    def stop(self):
-        self.running = False
+    return segments, flowers
 
 
-# ---------------------------------------------------------------------------
-# Main Application
-# ---------------------------------------------------------------------------
-
-class FlowerApp(mglw.WindowConfig):
-    gl_version = (3, 3)
-    title = "Interactive Blooming Flower"
-    window_size = (1280, 720)
-    aspect_ratio = None  # Allow flexible aspect
+# ── Main window class ────────────────────────────────────────────────
+class FlowerWindow(mglw.WindowConfig):
+    title       = "Flowers-For-Her"
+    window_size = WINDOW_SIZE
+    gl_version  = (3, 3)
+    aspect_ratio = None
+    resizable   = True
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.ctx.enable(moderngl.BLEND)
-        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx: moderngl.Context
 
-        # ---- State ----
-        self.growth = 0.0        # 0..1 controlled by left hand openness
-        self.bloom_amount = 0.0  # 0..1 controlled by right hand openness
-        self.hand_data = {'hands': []}
-        self.last_frame = None
-        self.webcam_size = (1280, 720)
-
-        # ---- CV Thread ----
-        self.data_queue = queue.Queue(maxsize=2)
-        self.cv_worker = CVWorker(self.data_queue)
+        # ── Hand tracking ────────────────────────────────────────────
+        self.cv_worker = CVWorker()
         self.cv_worker.start()
 
-        # ---- Build Shaders ----
-        self._build_shaders()
+        self.growth_raw    = 0.0
+        self.bloom_raw     = 0.0
+        self.growth_smooth = 0.0
+        self.bloom_smooth  = 0.0
+        self._last_time    = time.monotonic()
 
-        # ---- Build Geometry ----
-        self._build_geometry()
-
-        # ---- Build FBOs for post-processing ----
-        self._build_fbos()
-
-        # ---- Webcam Texture ----
-        self.webcam_tex = self.ctx.texture(self.webcam_size, 3, dtype='f1')
-        self.webcam_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-
-    # ---------------------------------------------------------------
-    # Setup helpers
-    # ---------------------------------------------------------------
-
-    def _build_shaders(self):
-        """Compile all shader programs."""
-        # Flower shader (3D geometry with bloom deformation)
-        self.flower_prog = self.ctx.program(
-            vertex_shader=load_shader('flower.vert'),
-            fragment_shader=load_shader('flower.frag'),
+        # ── Build geometry ───────────────────────────────────────────
+        flower_verts, flower_idx = build_flower_mesh(
+            n_petals=6, n_layers=2, n_u=12, n_v=8, base_size=1.0,
+        )
+        stamen_verts, stamen_idx = build_stamen_mesh(
+            n_stamens=8, base_size=1.0,
         )
 
-        # Fullscreen quad shader (webcam background + texture passes)
-        quad_vert = load_shader('quad.vert')
+        self.flower_vbo = self.ctx.buffer(flower_verts.tobytes())
+        self.flower_ibo = self.ctx.buffer(flower_idx.tobytes())
+        self.stamen_vbo = self.ctx.buffer(stamen_verts.tobytes())
+        self.stamen_ibo = self.ctx.buffer(stamen_idx.tobytes())
+
+        # ── Compile shaders ──────────────────────────────────────────
+        self.flower_prog = self.ctx.program(
+            vertex_shader=_load_shader("flower.vert"),
+            fragment_shader=_load_shader("flower.frag"),
+        )
+        self.stem_prog = self.ctx.program(
+            vertex_shader=_load_shader("stem.vert"),
+            fragment_shader=_load_shader("stem.frag"),
+        )
         self.quad_prog = self.ctx.program(
-            vertex_shader=quad_vert,
-            fragment_shader=load_shader('quad.frag'),
+            vertex_shader=_load_shader("quad.vert"),
+            fragment_shader=_load_shader("quad.frag"),
         )
         self.blur_prog = self.ctx.program(
-            vertex_shader=quad_vert,
-            fragment_shader=load_shader('blur.frag'),
+            vertex_shader=_load_shader("quad.vert"),
+            fragment_shader=_load_shader("blur.frag"),
         )
         self.composite_prog = self.ctx.program(
-            vertex_shader=quad_vert,
-            fragment_shader=load_shader('composite.frag'),
+            vertex_shader=_load_shader("quad.vert"),
+            fragment_shader=_load_shader("composite.frag"),
         )
 
-    def _build_geometry(self):
-        """Create VAOs for petal, stem, and center meshes, plus a fullscreen quad."""
-        # Petal (lily-shaped: wider, rounder, with center groove)
-        petal_vdata, petal_idx = create_petal_mesh(length=0.75, max_width=0.20,
-                                                    segs_len=14, segs_wid=6)
-        petal_vbo = self.ctx.buffer(petal_vdata)
-        petal_ibo = self.ctx.buffer(petal_idx)
-        self.petal_vao = self.ctx.vertex_array(
+        # ── Flower VAO (11-float vertex format) ─────────────────────
+        # Note: a_uv is optimised away by the GLSL compiler (v_uv is
+        # declared but unused in flower.frag), so we skip those 8 bytes
+        # with padding (8x) instead of binding to a missing attribute.
+        vao_fmt   = '3f 3f 8x 1f 1f 1f'
+        vao_attrs = ('a_position', 'a_normal',
+                     'a_normY', 'a_layer', 'a_petalAngle')
+
+        self.flower_vao = self.ctx.vertex_array(
             self.flower_prog,
-            [(petal_vbo, '3f 3f', 'in_position', 'in_normal')],
-            petal_ibo,
+            [(self.flower_vbo, vao_fmt, *vao_attrs)],
+            index_buffer=self.flower_ibo,
+        )
+        self.stamen_vao = self.ctx.vertex_array(
+            self.flower_prog,
+            [(self.stamen_vbo, vao_fmt, *vao_attrs)],
+            index_buffer=self.stamen_ibo,
         )
 
-        # Stem
-        stem_vdata, stem_idx = create_stem_mesh(radius=0.010, height=1.0)
-        stem_vbo = self.ctx.buffer(stem_vdata)
-        stem_ibo = self.ctx.buffer(stem_idx)
+        # ── Build 3D stem cylinder geometry ─────────────────────────
+        stem_verts, stem_idx = build_stem_segment(length=1.0, radius=1.0, n_sides=8)
+        self.stem_vbo = self.ctx.buffer(stem_verts.tobytes())
+        self.stem_ibo = self.ctx.buffer(stem_idx.tobytes())
+
+        # Stem VAO: positions (3f), normals (3f), then skip the other 5 attributes (20x)
         self.stem_vao = self.ctx.vertex_array(
-            self.flower_prog,
-            [(stem_vbo, '3f 3f', 'in_position', 'in_normal')],
-            stem_ibo,
+            self.stem_prog,
+            [(self.stem_vbo, '3f 3f 20x', 'a_position', 'a_normal')],
+            index_buffer=self.stem_ibo,
         )
 
-        # Flower center
-        center_vdata, center_idx = create_center_mesh(radius=0.035)
-        center_vbo = self.ctx.buffer(center_vdata)
-        center_ibo = self.ctx.buffer(center_idx)
-        self.center_vao = self.ctx.vertex_array(
-            self.flower_prog,
-            [(center_vbo, '3f 3f', 'in_position', 'in_normal')],
-            center_ibo,
-        )
-
-        # Fullscreen quad (for background / post-processing passes)
-        #   positions: (-1,-1) to (1,1)   UVs: (0,0) to (1,1)
-        quad_data = np.array([
+        # ── Fullscreen quad ──────────────────────────────────────────
+        quad_verts = np.array([
             -1, -1,  0, 0,
              1, -1,  1, 0,
              1,  1,  1, 1,
             -1, -1,  0, 0,
              1,  1,  1, 1,
             -1,  1,  0, 1,
-        ], dtype='f4')
-        quad_vbo = self.ctx.buffer(quad_data)
+        ], dtype=np.float32)
+        self.quad_vbo = self.ctx.buffer(quad_verts.tobytes())
 
         self.quad_vao_bg = self.ctx.vertex_array(
-            self.quad_prog, [(quad_vbo, '2f 2f', 'in_position', 'in_texcoord')])
+            self.quad_prog,
+            [(self.quad_vbo, '2f 2f', 'a_position', 'a_uv')],
+        )
         self.quad_vao_blur = self.ctx.vertex_array(
-            self.blur_prog, [(quad_vbo, '2f 2f', 'in_position', 'in_texcoord')])
+            self.blur_prog,
+            [(self.quad_vbo, '2f 2f', 'a_position', 'a_uv')],
+        )
         self.quad_vao_comp = self.ctx.vertex_array(
-            self.composite_prog, [(quad_vbo, '2f 2f', 'in_position', 'in_texcoord')])
+            self.composite_prog,
+            [(self.quad_vbo, '2f 2f', 'a_position', 'a_uv')],
+        )
 
-    def _build_fbos(self):
-        """Create off-screen framebuffer objects for the bloom post-processing pipeline."""
-        w, h = self.window_size
+        # ── FBOs ─────────────────────────────────────────────────────
+        w, h = self.wnd.buffer_size
+        self._setup_fbos(w, h)
 
-        # FBO for rendering flowers (RGBA so we can composite over webcam)
+        # ── Webcam texture (placeholder size, resized on first frame)
+        self.webcam_tex = self.ctx.texture((1280, 720), 3, dtype='f1')
+        self.webcam_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+    # ── FBO management ───────────────────────────────────────────────
+
+    def _setup_fbos(self, w: int, h: int):
+        """Create / recreate framebuffers at the given resolution."""
+        # Full-res flower FBO (RGBA16F for HDR bloom)
         self.flower_tex = self.ctx.texture((w, h), 4, dtype='f2')
         self.flower_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.flower_depth = self.ctx.depth_renderbuffer((w, h))
@@ -247,305 +265,209 @@ class FlowerApp(mglw.WindowConfig):
             depth_attachment=self.flower_depth,
         )
 
-        # Half-res FBOs for blur (cheaper, wider glow)
-        bw, bh = w // 2, h // 2
-        self.blur_tex_h = self.ctx.texture((bw, bh), 4, dtype='f2')
-        self.blur_tex_h.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.blur_fbo_h = self.ctx.framebuffer(color_attachments=[self.blur_tex_h])
+        # Half-res blur FBOs
+        hw, hh = max(w // 2, 1), max(h // 2, 1)
 
-        self.blur_tex_v = self.ctx.texture((bw, bh), 4, dtype='f2')
-        self.blur_tex_v.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.blur_fbo_v = self.ctx.framebuffer(color_attachments=[self.blur_tex_v])
+        self.blur_h_tex = self.ctx.texture((hw, hh), 4, dtype='f2')
+        self.blur_h_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.blur_h_fbo = self.ctx.framebuffer(
+            color_attachments=[self.blur_h_tex],
+        )
 
-    # ---------------------------------------------------------------
-    # Render loop
-    # ---------------------------------------------------------------
+        self.blur_v_tex = self.ctx.texture((hw, hh), 4, dtype='f2')
+        self.blur_v_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.blur_v_fbo = self.ctx.framebuffer(
+            color_attachments=[self.blur_v_tex],
+        )
 
-    def on_render(self, time_val, frame_time):
-        """Main render callback — multi-pass pipeline."""
+    def on_resize(self, width: int, height: int):
+        self._setup_fbos(width, height)
 
-        # 1. Consume latest data from CV thread
-        self._update_from_cv()
+    # ── Per-frame render ─────────────────────────────────────────────
 
-        # 2. Compute growth and bloom from hand openness (with EMA smoothing)
-        self._update_controls(frame_time)
+    def on_render(self, time_val: float, frame_time: float):
+        now = time.monotonic()
+        dt  = now - self._last_time
+        self._last_time = now
 
-        # --- Pass 1: Webcam background to default framebuffer ---
-        self.ctx.screen.use()
-        self.ctx.clear(0.02, 0.02, 0.05)
-        self.ctx.disable(moderngl.DEPTH_TEST)
-        self._render_webcam_background()
+        # ── 1. Consume hand-tracking data ────────────────────────────
+        fd = self.cv_worker.latest()
+        if fd is not None:
+            h_img, w_img = fd.frame.shape[:2]
 
-        # --- Pass 2: Render flowers to off-screen FBO ---
+            # BGR → RGB for OpenGL, then flip vertically (GL origin = bottom-left)
+            rgb_frame = cv2.cvtColor(fd.frame, cv2.COLOR_BGR2RGB)
+            rgb_frame = cv2.flip(rgb_frame, 0)
+
+            if self.webcam_tex.size != (w_img, h_img):
+                self.webcam_tex.release()
+                self.webcam_tex = self.ctx.texture(
+                    (w_img, h_img), 3, dtype='f1',
+                )
+                self.webcam_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.webcam_tex.write(rgb_frame.tobytes())
+
+            # Extract hand data — labels are anatomical:
+            #   "Left" = user's left hand → growth
+            #   "Right" = user's right hand → bloom
+            self.growth_raw = 0.0
+            self.bloom_raw  = 0.0
+            for hand in fd.hands:
+                if hand.label == "Left":
+                    self.growth_raw = hand.openness
+                elif hand.label == "Right":
+                    self.bloom_raw = hand.openness
+
+        # ── 2. EMA smoothing ─────────────────────────────────────────
+        smooth = 1.0 - pow(0.02, dt) if dt > 0 else 0.0
+        self.growth_smooth += (self.growth_raw - self.growth_smooth) * smooth
+        self.bloom_smooth  += (self.bloom_raw  - self.bloom_smooth)  * smooth
+
+        growth = self.growth_smooth
+        bloom  = self.bloom_smooth
+
+        # ── 3. Build branch tree ─────────────────────────────────────
+        segments, flower_positions = _build_branches(max(growth, 0.05))
+
+        # ── 4. Projection / View (adjusted to frame the larger tree) ─
+        w, h   = self.wnd.buffer_size
+        aspect = w / h if h > 0 else 1.0
+        proj = Matrix44.perspective_projection(
+            45.0, aspect, 0.1, 100.0, dtype='f4',
+        )
+        view = Matrix44.look_at(
+            eye    = Vector3([0.0, 1.0, 6.2], dtype='f4'),
+            target = Vector3([0.0, 0.6, 0.0], dtype='f4'),
+            up     = Vector3([0.0, 1.0, 0.0], dtype='f4'),
+            dtype  = 'f4',
+        )
+
+        # ═════════════════════════════════════════════════════════════
+        # PASS 1 — Render branches + flowers into flower_fbo
+        # ═════════════════════════════════════════════════════════════
         self.flower_fbo.use()
         self.flower_fbo.clear(0.0, 0.0, 0.0, 0.0)
         self.ctx.enable(moderngl.DEPTH_TEST)
-        self._render_flowers()
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (
+            moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA,
+        )
 
-        # --- Pass 3: Bloom post-processing (blur the flower texture) ---
-        self.ctx.disable(moderngl.DEPTH_TEST)
-        self._render_bloom_blur()
+        # ── Render 3D Stems (Cylinders) ──────────────────────────────
+        self.stem_prog['u_view'].write(view.tobytes())
+        self.stem_prog['u_proj'].write(proj.tobytes())
+        self.stem_prog['u_bloom'].value = bloom
 
-        # --- Pass 4: Composite everything to screen ---
-        self.ctx.screen.use()
-        self._render_composite()
+        for seg in segments:
+            x1, y1, z1, x2, y2, z2, thick = seg
+            
+            p1 = np.array([x1, y1, z1], dtype=np.float32)
+            p2 = np.array([x2, y2, z2], dtype=np.float32)
+            direction = p2 - p1
+            length = np.linalg.norm(direction)
+            if length < 1e-5:
+                continue
+            dir_norm = direction / length
 
-    # ---------------------------------------------------------------
-    # Per-frame updates
-    # ---------------------------------------------------------------
-
-    def _update_from_cv(self):
-        """Pull the latest frame + hand data from the CV thread."""
-        try:
-            while not self.data_queue.empty():
-                payload = self.data_queue.get_nowait()
-                self.last_frame = payload['frame']
-                self.hand_data = payload['hand_data']
-                self.webcam_size = (self.last_frame.shape[1], self.last_frame.shape[0])
-        except queue.Empty:
-            pass
-
-        # Upload webcam frame to GPU texture
-        if self.last_frame is not None:
-            # Draw Grow / Bloom labels on the frame
-            display_frame = self.last_frame.copy()
-            h, w = display_frame.shape[:2]
-            cv2.putText(display_frame, f"Grow: {self.growth:.2f}",
-                        (int(w * 0.38), int(h * 0.42)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 80, 255), 2, cv2.LINE_AA)
-            cv2.putText(display_frame, f"Bloom: {self.bloom_amount:.2f}",
-                        (int(w * 0.58), int(h * 0.62)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 80, 255), 2, cv2.LINE_AA)
-
-            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-            frame_rgb = cv2.flip(frame_rgb, 0)  # Flip for OpenGL origin
-            # Resize webcam texture if camera resolution changed
-            if (self.webcam_tex.width, self.webcam_tex.height) != (frame_rgb.shape[1], frame_rgb.shape[0]):
-                self.webcam_tex.release()
-                self.webcam_tex = self.ctx.texture((frame_rgb.shape[1], frame_rgb.shape[0]), 3, dtype='f1')
-                self.webcam_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            self.webcam_tex.write(frame_rgb.tobytes())
-
-    def _update_controls(self, frame_time):
-        """Map hand openness → growth / bloom with EMA smoothing."""
-        target_growth = 0.0
-        target_bloom = 0.0
-
-        for hand in self.hand_data.get('hands', []):
-            label = hand.get('label', '')
-            openness = hand.get('openness', 0.0)
-
-            # NOTE: MediaPipe "Left" means the left hand in the *mirrored* image,
-            # which is actually the user's right hand.  We've already mirrored the
-            # frame in the CV thread, so 'Left' label → user's LEFT hand.
-            if label == 'Left':
-                target_growth = max(target_growth, openness)
+            # Default cylinder axis is +Y: (0, 1, 0)
+            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            
+            # Calculate rotation axis and angle
+            axis = np.cross(up, dir_norm)
+            axis_len = np.linalg.norm(axis)
+            
+            if axis_len < 1e-6:
+                if dir_norm[1] < 0:
+                    rot = Matrix44.from_x_rotation(np.pi, dtype='f4')
+                else:
+                    rot = Matrix44.identity(dtype='f4')
             else:
-                target_bloom = max(target_bloom, openness)
+                axis = axis / axis_len
+                angle = np.arccos(np.clip(np.dot(up, dir_norm), -1.0, 1.0))
+                quat = Quaternion.from_axis_rotation(axis, angle)
+                rot = Matrix44.from_quaternion(quat, dtype='f4')
 
-        # EMA smoothing
-        smooth = min(1.0, (frame_time if frame_time > 0 else 0.016) * 3.0)
-        self.growth += (target_growth - self.growth) * smooth
-        self.bloom_amount += (target_bloom - self.bloom_amount) * smooth
+            scale = Matrix44.from_scale(Vector3([thick, length, thick], dtype='f4'), dtype='f4')
+            translation = Matrix44.from_translation(Vector3(p1, dtype='f4'), dtype='f4')
+            
+            model = translation @ rot @ scale
+            self.stem_prog['u_model'].write(model.tobytes())
+            self.stem_vao.render()
 
-    # ---------------------------------------------------------------
-    # Render passes
-    # ---------------------------------------------------------------
+        # ── Flowers at terminal branches ─────────────────────────────
+        # Set view / proj / bloom once (they don't change per flower)
+        self.flower_prog['u_view'].write(view.tobytes())
+        self.flower_prog['u_proj'].write(proj.tobytes())
+        self.flower_prog['u_bloom'].value = bloom
 
-    def _render_webcam_background(self):
-        """Pass 1: Draw the webcam frame as a fullscreen background quad."""
-        self.webcam_tex.use(0)
-        self.quad_prog['u_texture'].value = 0
-        self.quad_vao_bg.render(moderngl.TRIANGLES)
-
-    # Branch definitions: (height_frac, angle_degrees, branch_len, flower_scale)
-    # height_frac: where along the MAIN TRUNK the branch splits off (0=base, 1=top)
-    # Pattern matches reference: lower branches spread wide, upper ones more upright.
-    # Alternating left/right creates a natural tree silhouette.
-    BRANCHES = [
-        (0.22, -68,  0.55, 0.80),   # Lowest-left  (very wide spread)
-        (0.28,  62,  0.48, 0.78),   # Lowest-right (very wide spread)
-        (0.42, -42,  0.58, 0.88),   # Mid-lower-left
-        (0.48,  48,  0.52, 0.84),   # Mid-lower-right
-        (0.60, -55,  0.50, 0.86),   # Mid-upper-left (wide)
-        (0.68,  38,  0.54, 0.83),   # Mid-upper-right
-        (0.80, -22,  0.42, 0.90),   # Upper-left (more upright)
-        (0.88,  15,  0.38, 0.88),   # Upper-right (more upright)
-        (1.00,   0,  0.00, 1.00),   # Crown (flower on trunk tip)
-    ]
-
-    def _render_flowers(self):
-        """Pass 2: Render branching lily tree — main trunk with branches and flowers."""
-        w, h = self.wnd.buffer_size
-        aspect = w / h if h > 0 else 1.0
-
-        proj = Matrix44.orthogonal_projection(
-            -aspect, aspect, -1.0, 1.0, -10.0, 10.0, dtype='f4'
-        )
-        self.flower_prog['u_projection'].write(proj)
-
-        # Fixed base position of the main trunk
-        base_x = -0.1
-        base_y = -0.85
-
-        # Main trunk height (grows with left-hand openness)
-        trunk_h = 0.10 + self.growth * 1.50
-
-        # Overall plant scale
-        plant_s = 0.40 + self.growth * 0.60
-
-        # Flower bud scale
-        bud_scale = 0.15 + self.growth * 0.50
-
-        # ---- Render main trunk ----
-        trunk_model = (
-            Matrix44.from_translation([base_x, base_y, 0.0], dtype='f4') *
-            Matrix44.from_scale([plant_s * 0.5, trunk_h, plant_s * 0.5], dtype='f4')
-        )
-        self.flower_prog['u_model'].write(trunk_model.astype('f4'))
-        self.flower_prog['u_bloom'].value = self.bloom_amount
-        self.flower_prog['u_part'].value = 0  # stem
-        self.stem_vao.render(moderngl.TRIANGLES)
-
-        # ---- Render branches + lily flowers ----
-        for (t_frac, angle_deg, branch_len, f_scale) in self.BRANCHES:
-            self._render_branch_and_lily(
-                base_x, base_y, trunk_h, plant_s,
-                t_frac, angle_deg, branch_len,
-                bud_scale * f_scale,
-            )
-
-    def _render_branch_and_lily(self, base_x, base_y, trunk_h, plant_s,
-                                 t_frac, angle_deg, branch_len, flower_size):
-        """Render one branch forking off the trunk, with a lily flower at the tip."""
-        # Branch origin = point on the trunk at height t_frac
-        branch_y = base_y + t_frac * trunk_h
-        angle_rad = math.radians(angle_deg)
-
-        # Effective branch length (grows with plant)
-        eff_len = branch_len * (0.15 + self.growth * 0.85)
-
-        # ---- Branch stem (only if there IS a branch, not the top flower) ----
-        if branch_len > 0.01:
-            br_model = (
-                Matrix44.from_translation([base_x, branch_y, 0.0], dtype='f4') *
-                Matrix44.from_z_rotation(angle_rad, dtype='f4') *
-                Matrix44.from_scale([plant_s * 0.4, eff_len, plant_s * 0.4], dtype='f4')
-            )
-            self.flower_prog['u_model'].write(br_model.astype('f4'))
-            self.flower_prog['u_bloom'].value = self.bloom_amount
-            self.flower_prog['u_part'].value = 0
-            self.stem_vao.render(moderngl.TRIANGLES)
-
-        # Flower tip position
-        tip_x = base_x + math.sin(angle_rad) * eff_len
-        tip_y = branch_y + math.cos(angle_rad) * eff_len
-
-        head = (
-            Matrix44.from_translation([tip_x, tip_y, 0.0], dtype='f4') *
-            Matrix44.from_scale([flower_size, flower_size, flower_size], dtype='f4')
-        )
-
-        # ---- Lily petals: 6 tepals in 2 alternating layers of 3 ----
-        for p in range(6):
-            petal_angle = (p / 6.0) * math.pi * 2.0
-            layer = p % 2   # alternating inner/outer
-            tilt = 0.03 + layer * 0.04   # inner layer slightly more upright
-            scale = 1.0 - layer * 0.06   # outer layer slightly larger
-
-            petal_model = (
-                head *
-                Matrix44.from_scale([scale, scale, scale], dtype='f4') *
-                Matrix44.from_y_rotation(petal_angle, dtype='f4') *
-                Matrix44.from_x_rotation(-tilt, dtype='f4')
-            )
-            self.flower_prog['u_model'].write(petal_model.astype('f4'))
-            self.flower_prog['u_bloom'].value = self.bloom_amount
-            self.flower_prog['u_part'].value = 1
-            self.petal_vao.render(moderngl.TRIANGLES)
-
-        # ---- Stamens: 6 thin rods with anthers (visible when blooming) ----
-        if self.bloom_amount > 0.08:
-            for s in range(6):
-                stamen_angle = (s / 6.0) * math.pi * 2.0 + math.pi / 6.0
-                stamen_tilt = 0.25 + self.bloom_amount * 0.55
-
-                # Stamen rod (reuse stem VAO, very thin)
-                stamen_model = (
-                    head *
-                    Matrix44.from_y_rotation(stamen_angle, dtype='f4') *
-                    Matrix44.from_x_rotation(-stamen_tilt, dtype='f4') *
-                    Matrix44.from_scale([0.12, 0.45, 0.12], dtype='f4')
+        for fx, fy, fz, fsize in flower_positions:
+            model = (
+                Matrix44.from_translation(
+                    Vector3([fx, fy, fz], dtype='f4'), dtype='f4',
                 )
-                self.flower_prog['u_model'].write(stamen_model.astype('f4'))
-                self.flower_prog['u_part'].value = 3  # stamen color
-                self.stem_vao.render(moderngl.TRIANGLES)
-
-                # Anther (tiny sphere at stamen tip)
-                anther_model = (
-                    head *
-                    Matrix44.from_y_rotation(stamen_angle, dtype='f4') *
-                    Matrix44.from_x_rotation(-stamen_tilt, dtype='f4') *
-                    Matrix44.from_translation([0.0, 0.45, 0.0], dtype='f4') *
-                    Matrix44.from_scale([0.08, 0.12, 0.08], dtype='f4')
+                @ Matrix44.from_scale(
+                    Vector3([fsize, fsize, fsize], dtype='f4'), dtype='f4',
                 )
-                self.flower_prog['u_model'].write(anther_model.astype('f4'))
-                self.flower_prog['u_part'].value = 3  # anther color
-                self.center_vao.render(moderngl.TRIANGLES)
+            )
+            self.flower_prog['u_model'].write(model.tobytes())
+            self.flower_vao.render()
 
-        # ---- Center pistil (visible when blooming) ----
-        if self.bloom_amount > 0.10:
-            self.flower_prog['u_model'].write(head.astype('f4'))
-            self.flower_prog['u_part'].value = 2
-            self.center_vao.render(moderngl.TRIANGLES)
+            # Stamens (visible when blooming)
+            if bloom > 0.05:
+                self.stamen_vao.render()
 
-    def _render_bloom_blur(self):
-        """Pass 3: Two-pass Gaussian blur on the flower texture for glow."""
-        # Horizontal blur: flower_tex → blur_fbo_h
-        self.blur_fbo_h.use()
-        self.blur_fbo_h.clear(0.0, 0.0, 0.0, 0.0)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+
+        # ═════════════════════════════════════════════════════════════
+        # PASS 2 — Horizontal Gaussian blur → blur_h_fbo (half-res)
+        # ═════════════════════════════════════════════════════════════
+        self.blur_h_fbo.use()
+        self.blur_h_fbo.clear(0.0, 0.0, 0.0, 0.0)
+
         self.flower_tex.use(0)
         self.blur_prog['u_texture'].value = 0
-        bw = self.blur_tex_h.width
-        bh = self.blur_tex_h.height
-        self.blur_prog['u_direction'].value = (1.0 / bw, 0.0)
-        self.blur_prog['u_intensity'].value = 0.7 + self.bloom_amount * 0.8
-        self.quad_vao_blur.render(moderngl.TRIANGLES)
+        hw, hh = self.blur_h_tex.size
+        self.blur_prog['u_direction'].value = (1.0 / hw, 0.0)
+        self.quad_vao_blur.render()
 
-        # Vertical blur: blur_tex_h → blur_fbo_v
-        self.blur_fbo_v.use()
-        self.blur_fbo_v.clear(0.0, 0.0, 0.0, 0.0)
-        self.blur_tex_h.use(0)
-        self.blur_prog['u_direction'].value = (0.0, 1.0 / bh)
-        self.blur_prog['u_intensity'].value = 0.7 + self.bloom_amount * 0.8
-        self.quad_vao_blur.render(moderngl.TRIANGLES)
+        # ═════════════════════════════════════════════════════════════
+        # PASS 3 — Vertical Gaussian blur → blur_v_fbo (half-res)
+        # ═════════════════════════════════════════════════════════════
+        self.blur_v_fbo.use()
+        self.blur_v_fbo.clear(0.0, 0.0, 0.0, 0.0)
 
-    def _render_composite(self):
-        """Pass 4: Composite flowers + glow on top of the webcam background."""
-        # Draw flowers with alpha blending
-        self.ctx.enable(moderngl.BLEND)
-        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-        self.flower_tex.use(0)
-        self.quad_prog['u_texture'].value = 0
-        self.quad_vao_bg.render(moderngl.TRIANGLES)
+        self.blur_h_tex.use(0)
+        self.blur_prog['u_texture'].value = 0
+        self.blur_prog['u_direction'].value = (0.0, 1.0 / hh)
+        self.quad_vao_blur.render()
 
-        # Draw glow with additive blending
-        self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)
-        self.blur_tex_v.use(0)
-        self.quad_prog['u_texture'].value = 0
-        self.quad_vao_bg.render(moderngl.TRIANGLES)
+        # ═════════════════════════════════════════════════════════════
+        # PASS 4 — Composite → screen
+        # ═════════════════════════════════════════════════════════════
+        self.ctx.screen.use()
+        self.ctx.clear(*BG_COLOR)
+        self.ctx.disable(moderngl.DEPTH_TEST)
 
-        # Reset blend mode
-        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.webcam_tex.use(0)
+        self.flower_tex.use(1)
+        self.blur_v_tex.use(2)
 
-    # ---------------------------------------------------------------
-    # Cleanup
-    # ---------------------------------------------------------------
+        self.composite_prog['u_background'].value    = 0
+        self.composite_prog['u_flower'].value         = 1
+        self.composite_prog['u_bloom_blur'].value     = 2
+        self.composite_prog['u_bloom_strength'].value = 0.4 + 0.6 * bloom
 
-    def close(self):
+        self.quad_vao_comp.render()
+
+        self.ctx.disable(moderngl.BLEND)
+
+    # ── Cleanup ──────────────────────────────────────────────────────
+
+    def on_close(self):
         self.cv_worker.stop()
-        self.cv_worker.join(timeout=2.0)
 
 
+# ── Entry point ──────────────────────────────────────────────────────
 if __name__ == '__main__':
-    mglw.run_window_config(FlowerApp)
+    settings.WINDOW['class'] = 'moderngl_window.context.pyglet.Window'
+    FlowerWindow.run()
