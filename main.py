@@ -34,7 +34,7 @@ WINDOW_SIZE     = (1280, 720)
 BG_COLOR        = (0.03, 0.02, 0.04, 1.0)
 
 # Tree structure
-TRUNK_BASE_LEN  = 4.3        # GL units (80% bigger overall)
+TRUNK_BASE_LEN  = 3.0        # GL units (30% smaller overall)
 BRANCH_SHRINK   = 0.65
 MAX_DEPTH       = 3
 MIN_BRANCH_LEN  = 0.05
@@ -91,7 +91,7 @@ def _build_branches(growth: float):
         segments.append((x, y, z, ex, ey, ez, thickness))
 
         if depth == MAX_DEPTH or length < 0.25:
-            flower_size = 0.50 + thickness * 0.22
+            flower_size = 0.42 + thickness * 0.18
             flowers.append((ex, ey, ez, flower_size))
             return
 
@@ -105,29 +105,29 @@ def _build_branches(growth: float):
             c_angle = angle + frac * spread * 2
             _branch(ex, ey, ez, c_angle, child_len, child_thick, depth + 1)
 
-    # Main trunk (moved down to -1.5 to make room for taller tree)
-    trunk_base = (0.0, -1.5, 0.0)
-    trunk_top  = (0.0, -1.5 + trunk_len, 0.0)
-    segments.append((*trunk_base, *trunk_top, 0.11))
+    # Main trunk (moved down to -1.5 to make room for taller tree, shifted left to -0.9)
+    trunk_base = (-0.9, -1.5, 0.0)
+    trunk_top  = (-0.9, -1.5 + trunk_len, 0.0)
+    segments.append((*trunk_base, *trunk_top, 0.028))
 
-    # Side branches at different heights along the trunk (scaled lengths & thicknesses)
+    # Side branches at different heights along the trunk (scaled lengths & thicknesses, shifted left)
     branch_defs = [
-        (0.55, math.pi / 2 - 0.65, 2.25, 0.080),
-        (0.55, math.pi / 2 + 0.65, 2.25, 0.080),
-        (0.72, math.pi / 2 - 0.45, 1.89, 0.070),
-        (0.72, math.pi / 2 + 0.45, 1.89, 0.070),
-        (0.88, math.pi / 2 - 0.25, 1.53, 0.050),
-        (0.88, math.pi / 2 + 0.25, 1.53, 0.050),
+        (0.55, math.pi / 2 - 0.65, 1.57, 0.020),
+        (0.55, math.pi / 2 + 0.65, 1.57, 0.020),
+        (0.72, math.pi / 2 - 0.45, 1.32, 0.017),
+        (0.72, math.pi / 2 + 0.45, 1.32, 0.017),
+        (0.88, math.pi / 2 - 0.25, 1.07, 0.013),
+        (0.88, math.pi / 2 + 0.25, 1.07, 0.013),
     ]
 
     for frac, angle, rel_len, thick in branch_defs:
         by = -1.5 + trunk_len * frac
         if by <= -1.5 + trunk_len:
-            _branch(0.0, by, 0.0, angle, rel_len * growth, thick, 1)
+            _branch(-0.9, by, 0.0, angle, rel_len * growth, thick, 1)
 
     # Top of trunk also branches straight up
     _branch(trunk_top[0], trunk_top[1], 0.0,
-            math.pi / 2, 1.35 * growth, 0.060, 2)
+            math.pi / 2, 0.95 * growth, 0.015, 2)
 
     return segments, flowers
 
@@ -336,8 +336,8 @@ class FlowerWindow(mglw.WindowConfig):
             45.0, aspect, 0.1, 100.0, dtype='f4',
         )
         view = Matrix44.look_at(
-            eye    = Vector3([0.0, 1.0, 6.2], dtype='f4'),
-            target = Vector3([0.0, 0.6, 0.0], dtype='f4'),
+            eye    = Vector3([0.0, 0.6, 5.2], dtype='f4'),
+            target = Vector3([0.0, 0.4, 0.0], dtype='f4'),
             up     = Vector3([0.0, 1.0, 0.0], dtype='f4'),
             dtype  = 'f4',
         )
@@ -390,7 +390,7 @@ class FlowerWindow(mglw.WindowConfig):
             scale = Matrix44.from_scale(Vector3([thick, length, thick], dtype='f4'), dtype='f4')
             translation = Matrix44.from_translation(Vector3(p1, dtype='f4'), dtype='f4')
             
-            model = translation @ rot @ scale
+            model = scale @ rot @ translation
             self.stem_prog['u_model'].write(model.tobytes())
             self.stem_vao.render()
 
@@ -402,11 +402,11 @@ class FlowerWindow(mglw.WindowConfig):
 
         for fx, fy, fz, fsize in flower_positions:
             model = (
-                Matrix44.from_translation(
-                    Vector3([fx, fy, fz], dtype='f4'), dtype='f4',
-                )
-                @ Matrix44.from_scale(
+                Matrix44.from_scale(
                     Vector3([fsize, fsize, fsize], dtype='f4'), dtype='f4',
+                )
+                @ Matrix44.from_translation(
+                    Vector3([fx, fy, fz], dtype='f4'), dtype='f4',
                 )
             )
             self.flower_prog['u_model'].write(model.tobytes())

@@ -8,8 +8,8 @@ uniform float u_bloom; // 0 = bud, 1 = fully open
 out vec4 fragColor;
 
 void main() {
-    // Deep, dark royal/navy blue base color (richer contrast)
-    vec3 base_color = vec3(0.02, 0.08, 0.42); 
+    // Luminous periwinkle/light blue base color (20% less dark again)
+    vec3 base_color = vec3(0.18, 0.40, 0.85); 
 
     // Soft wrapping light
     vec3 lightDir = normalize(vec3(0.2, 1.0, 0.5));
@@ -31,5 +31,5 @@ void main() {
     lit += rim_color * fresnel * 0.9 * highlight_strength;
 
     // Emissive boost for the bloom pass to pick it up and glow
-    fragColor = vec4(lit, 0.90);
+    fragColor = vec4(lit, 0.80);
 }
